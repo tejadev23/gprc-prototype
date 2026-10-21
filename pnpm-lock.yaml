@@ -47,6 +47,9 @@ importers:
       three:
         specifier: ^0.186.1
         version: 0.186.1
+      tsx:
+        specifier: ^4.23.13
+        version: 4.23.15
     devDependencies:
       '@electric-sql/pglite':
         specifier: ^0.3.0
@@ -81,9 +84,6 @@ importers:
       tailwindcss:
         specifier: ^4
         version: 4.3.3
-      tsx:
-        specifier: ^4.23.13
-        version: 4.23.15
       typescript:
         specifier: ^5
         version: 5.9.3

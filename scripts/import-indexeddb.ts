@@ -66,7 +66,7 @@ async function readIndexedDb(profileDefault: string): Promise<ExportBundle> {
     const bundle = await page.evaluate("window.gprcExportIdb()");
     return bundle as ExportBundle;
   } finally {
-    await context?.close({ timeout: 5_000 }).catch(() => undefined);
+    await context?.close().catch(() => undefined);
     if (cleanup) rmSync(cleanup, { recursive: true, force: true });
   }
 }

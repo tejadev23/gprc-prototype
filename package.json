@@ -12,6 +12,9 @@
     "user:create": "tsx scripts/create-user.ts",
     "import:idb": "tsx scripts/import-indexeddb.ts"
   },
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.716.0",
     "clsx": "^2.1.1",
@@ -25,7 +28,8 @@
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "tailwind-merge": "^3.6.0",
-    "three": "^0.186.1"
+    "three": "^0.186.1",
+    "tsx": "^4.23.13"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.3.0",
@@ -39,7 +43,6 @@
     "eslint-config-next": "16.3.0",
     "playwright": "1.52.0",
     "tailwindcss": "^4",
-    "tsx": "^4.23.13",
     "typescript": "^5"
   },
   "packageManager": "pnpm@10.29.2"

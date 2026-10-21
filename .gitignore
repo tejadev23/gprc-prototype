@@ -6,4 +6,4 @@ data
 public/pdf.worker.min.mjs
 *.log
 .DS_Store
-tsconfig.tsbuildinfo
+*.tsbuildinfo

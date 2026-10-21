@@ -8,17 +8,27 @@ const memory = new Map<string, { body: Buffer; mime: string }>();
 
 function driver(): "memory" | "disk" | "s3" {
   const value = process.env.OBJECT_STORE;
-  if (value === "memory") return "memory";
-  if (value === "disk") return "disk";
+  const production = process.env.NODE_ENV === "production";
+  if (value === "memory" || value === "disk") {
+    if (production) {
+      throw new Error(
+        "OBJECT_STORE=memory and OBJECT_STORE=disk are not allowed in production. Set OBJECT_STORE=s3 plus S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY.",
+      );
+    }
+    return value;
+  }
+  if (value && value !== "s3") {
+    throw new Error(`Unknown OBJECT_STORE=${value}. Use s3, or disk/memory only in local development.`);
+  }
   return "s3";
 }
 
 function diskRoot(): string {
-  return process.env.OBJECT_DIR || join(process.cwd(), "data", "objects");
+  return process.env.OBJECT_DIR || join(/* turbopackIgnore: true */ process.cwd(), "data", "objects");
 }
 
 function diskPath(key: string): string {
-  return join(diskRoot(), key);
+  return join(/* turbopackIgnore: true */ diskRoot(), key);
 }
 
 function mimePath(key: string): string {
@@ -62,8 +72,8 @@ export async function getObject(key: string): Promise<{ body: Buffer; mime: stri
   if (mode === "memory") return memory.get(key) ?? null;
   if (mode === "disk") {
     try {
-      const body = await readFile(diskPath(key));
-      const mime = await readFile(mimePath(key), "utf8").catch(() => "application/octet-stream");
+      const body = await readFile(/* turbopackIgnore: true */ diskPath(key));
+      const mime = await readFile(/* turbopackIgnore: true */ mimePath(key), "utf8").catch(() => "application/octet-stream");
       return { body, mime: mime.trim() || "application/octet-stream" };
     } catch {
       return null;
