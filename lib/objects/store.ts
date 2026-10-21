@@ -1,0 +1,98 @@
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+
+export const MAX_UPLOAD_BYTES = 40 * 1024 * 1024;
+
+const memory = new Map<string, { body: Buffer; mime: string }>();
+
+function driver(): "memory" | "disk" | "s3" {
+  const value = process.env.OBJECT_STORE;
+  if (value === "memory") return "memory";
+  if (value === "disk") return "disk";
+  return "s3";
+}
+
+function diskRoot(): string {
+  return process.env.OBJECT_DIR || join(process.cwd(), "data", "objects");
+}
+
+function diskPath(key: string): string {
+  return join(diskRoot(), key);
+}
+
+function mimePath(key: string): string {
+  return `${diskPath(key)}.mime`;
+}
+
+function client(): S3Client {
+  const endpoint = process.env.S3_ENDPOINT;
+  const region = process.env.S3_REGION || "auto";
+  const accessKeyId = process.env.S3_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
+  if (!endpoint || !accessKeyId || !secretAccessKey || !process.env.S3_BUCKET) {
+    throw new Error("Object storage is not configured. Set S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY.");
+  }
+  return new S3Client({
+    region,
+    endpoint,
+    credentials: { accessKeyId, secretAccessKey },
+    forcePathStyle: true,
+  });
+}
+
+export async function putObject(key: string, body: Buffer, mime: string): Promise<void> {
+  const mode = driver();
+  if (mode === "memory") {
+    memory.set(key, { body, mime });
+    return;
+  }
+  if (mode === "disk") {
+    const path = diskPath(key);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, body);
+    await writeFile(mimePath(key), mime, "utf8");
+    return;
+  }
+  await client().send(new PutObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key, Body: body, ContentType: mime }));
+}
+
+export async function getObject(key: string): Promise<{ body: Buffer; mime: string } | null> {
+  const mode = driver();
+  if (mode === "memory") return memory.get(key) ?? null;
+  if (mode === "disk") {
+    try {
+      const body = await readFile(diskPath(key));
+      const mime = await readFile(mimePath(key), "utf8").catch(() => "application/octet-stream");
+      return { body, mime: mime.trim() || "application/octet-stream" };
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const result = await client().send(new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key }));
+    const bytes = await result.Body?.transformToByteArray();
+    if (!bytes) return null;
+    return { body: Buffer.from(bytes), mime: result.ContentType || "application/octet-stream" };
+  } catch {
+    return null;
+  }
+}
+
+export async function deleteObject(key: string): Promise<void> {
+  const mode = driver();
+  if (mode === "memory") {
+    memory.delete(key);
+    return;
+  }
+  if (mode === "disk") {
+    await rm(diskPath(key), { force: true });
+    await rm(mimePath(key), { force: true });
+    return;
+  }
+  await client().send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key }));
+}
+
+export function resetMemoryObjects(): void {
+  memory.clear();
+}

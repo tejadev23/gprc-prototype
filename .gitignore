@@ -1,0 +1,9 @@
+node_modules
+.next
+data
+.env
+.env.local
+public/pdf.worker.min.mjs
+*.log
+.DS_Store
+tsconfig.tsbuildinfo
