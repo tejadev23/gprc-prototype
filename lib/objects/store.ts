@@ -1,8 +1,9 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { MAX_UPLOAD_BYTES } from "./limits";
 
-export const MAX_UPLOAD_BYTES = 40 * 1024 * 1024;
+export { MAX_UPLOAD_BYTES };
 
 const memory = new Map<string, { body: Buffer; mime: string }>();
 

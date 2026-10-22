@@ -333,6 +333,9 @@ export function GprcLab() {
           />
         </label>
         <span className="text-[11px] text-muted">{session.projectId ? saveLabel(session.saveState) : "No project"}</span>
+        <a href="/migrate" className="rounded px-2 py-1 text-[12px] text-muted hover:bg-white/10 hover:text-foreground">
+          Migrate
+        </a>
         <button
           type="button"
           className="rounded px-2 py-1 text-[12px] text-muted hover:bg-white/10 hover:text-foreground"

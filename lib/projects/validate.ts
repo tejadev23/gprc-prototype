@@ -41,6 +41,15 @@ function station(value: unknown): Station {
 
 const TABS = new Set(["volume", "cutfill", "alignment", "kms"]);
 
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isoDate(value: unknown, label: string): string {
+  if (typeof value !== "string" || Number.isNaN(Date.parse(value))) {
+    throw new BadProjectData(`${label} is not a valid date.`);
+  }
+  return value;
+}
+
 export function parseProjectBody(value: unknown, id: string): EarthworkProject {
   if (!value || typeof value !== "object") throw new BadProjectData("Project body is missing.");
   const raw = value as Partial<EarthworkProject>;
@@ -68,6 +77,18 @@ export function parseProjectBody(value: unknown, id: string): EarthworkProject {
     },
     dockTab: TABS.has(raw.dockTab ?? "") ? raw.dockTab! : "volume",
     snap: raw.snap === true,
+  };
+}
+
+export function parseImportedProject(value: unknown): EarthworkProject {
+  if (!value || typeof value !== "object") throw new BadProjectData("Project body is missing.");
+  const raw = value as Partial<EarthworkProject>;
+  if (typeof raw.id !== "string" || !UUID_RE.test(raw.id)) throw new BadProjectData("Project id must be a UUID.");
+  const parsed = parseProjectBody(value, raw.id);
+  return {
+    ...parsed,
+    createdAt: isoDate(raw.createdAt, "createdAt"),
+    updatedAt: isoDate(raw.updatedAt, "updatedAt"),
   };
 }
 

@@ -1,8 +1,9 @@
 /**
- * One-time import of GPRC projects from the Earthwork-AI browser database
- * (IndexedDB name: earthwork-corridor) into Postgres for the bootstrap user.
+ * Legacy direct database importer. Do not run this against production.
+ * The supported path is the in-app exporter/importer at /migrate, which uses
+ * authenticated HTTP APIs and never embeds storage credentials in the zip.
  *
- * Usage:
+ * Usage (local development only):
  *   IDB_PROFILE_DEFAULT="/path/to/browser/Default" pnpm import:idb
  */
 import { randomUUID } from "node:crypto";
