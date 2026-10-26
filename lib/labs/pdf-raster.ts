@@ -5,8 +5,19 @@
  * pdf.js is loaded only in the browser (dynamic import) so Next SSR
  * does not pull the Node-incompatible main build.
  */
-import { IMPORT_RASTER_MAX_SIDE } from "./import-types";
+import { DISPLAY_MAX_SIDE, legacyRasterScale } from "@/lib/corridor/pdf-space";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+
+export type PdfPageRaster = {
+  objectUrl: string;
+  /** Bitmap size. Larger than the page when `renderScale` > 1. */
+  width: number;
+  height: number;
+  /** pdf.js viewport at scale 1. Traces and calibration use this space. */
+  userWidth: number;
+  userHeight: number;
+  renderScale: number;
+};
 
 let workerReady = false;
 
@@ -32,12 +43,23 @@ export async function openPdfDocument(data: ArrayBuffer): Promise<PDFDocumentPro
 export async function renderPdfPage(
   doc: PDFDocumentProxy,
   pageNumber: number,
-  maxSide = IMPORT_RASTER_MAX_SIDE,
-): Promise<{ objectUrl: string; width: number; height: number }> {
+  options?: number | { maxSide?: number; scale?: number },
+): Promise<PdfPageRaster> {
   await pdfjs();
   const page = await doc.getPage(pageNumber);
   const base = page.getViewport({ scale: 1 });
-  const scale = Math.min(maxSide / Math.max(base.width, base.height), 4);
+  const userWidth = base.width;
+  const userHeight = base.height;
+  const longest = Math.max(userWidth, userHeight, 1);
+  let scale: number;
+  if (typeof options === "number") {
+    scale = Math.min(options / longest, 4);
+  } else if (options?.scale != null) {
+    const cap = DISPLAY_MAX_SIDE / longest;
+    scale = Math.min(Math.max(options.scale, 0.25), cap, 8);
+  } else {
+    scale = legacyRasterScale(userWidth, userHeight);
+  }
   const viewport = page.getViewport({ scale });
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(viewport.width));
@@ -48,7 +70,7 @@ export async function renderPdfPage(
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   await page.render({ canvas, canvasContext: ctx, viewport }).promise;
   const objectUrl = await canvasToObjectUrl(canvas);
-  return { objectUrl, width: canvas.width, height: canvas.height };
+  return { objectUrl, width: canvas.width, height: canvas.height, userWidth, userHeight, renderScale: scale };
 }
 
 function canvasToObjectUrl(canvas: HTMLCanvasElement): Promise<string> {

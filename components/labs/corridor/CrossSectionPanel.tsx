@@ -5,15 +5,25 @@ import { CalibrationPanel } from "@/components/labs/corridor/CalibrationPanel";
 import { computeAreas } from "@/lib/corridor/areas";
 import { hitCalibrationGroup, pxToReal, realToPx, translateGroup, type CalibrationMove } from "@/lib/corridor/calibration";
 import { marksMatchRenderedPage } from "@/lib/corridor/page-ref";
-import { displayProfile } from "@/lib/corridor/profile";
+import { displayProfile, nearestSegment } from "@/lib/corridor/profile";
+import { framePoints, sectionPixels } from "@/lib/corridor/section-sync";
 import { isCalibrated } from "@/lib/corridor/stations";
 import type { CalibPoint, ProfilePoint, Station, TraceMode } from "@/lib/corridor/types";
 import { canvasBox, clientToCanvasCss } from "@/lib/corridor/viewer";
+import { displayRenderScale, legacyRasterScale } from "@/lib/corridor/pdf-space";
 import { cssToImage, fitView, pan, zoomAt } from "@/lib/tracing/coords";
 import type { ViewState } from "@/lib/tracing/types";
 import { cn } from "@/lib/utils";
 
-type Raster = { url: string; width: number; height: number; page: number };
+type Raster = {
+  url: string;
+  width: number;
+  height: number;
+  page: number;
+  userWidth?: number;
+  userHeight?: number;
+  renderScale?: number;
+};
 
 type Props = {
   raster: Raster | null;
@@ -45,6 +55,15 @@ type Props = {
   /** The page on screen is not the page this station was marked on. */
   pageMismatch?: { stationName: string; stationPage: number; viewPage: number } | null;
   onGoToStationPage?: () => void;
+  expanded?: boolean;
+  onToggleExpand?: () => void;
+  spacePan?: boolean;
+  insertKey?: "existing" | "proposed";
+  onInsert?: (key: "existing" | "proposed", segmentIndex: number, offset: number, elevation: number) => void;
+  onSelectPoint?: (point: { key: "existing" | "proposed"; offset: number; elevation: number } | null) => void;
+  selectedPoint?: { key: "existing" | "proposed"; offset: number; elevation: number } | null;
+  undoCount?: number;
+  onDisplayScale?: (scale: number) => void;
 };
 
 export function CrossSectionPanel({
@@ -76,6 +95,15 @@ export function CrossSectionPanel({
   onCancelMove,
   pageMismatch = null,
   onGoToStationPage,
+  expanded = false,
+  onToggleExpand,
+  spacePan = false,
+  insertKey = "existing",
+  onInsert,
+  onSelectPoint,
+  selectedPoint = null,
+  undoCount = 0,
+  onDisplayScale,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const viewRef = useRef<ViewState | null>(null);
@@ -84,35 +112,71 @@ export function CrossSectionPanel({
   const dragRef = useRef<{ x: number; y: number; panning: boolean; moved: boolean } | null>(null);
   const groupDragRef = useRef<{ x: number; y: number; dx: number; dy: number } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const moveOverlayRef = useRef<HTMLDivElement>(null);
   const [image, setImage] = useState<HTMLImageElement | null>(null);
   /** Page number of `image`. Null while the next page is loading, so the previous image is not reused. */
   const [imagePage, setImagePage] = useState<number | null>(null);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const viewMode = useRef<"section" | "page" | "user">("page");
+  const seenStationId = useRef<string | null | undefined>(undefined);
   const [view, setView] = useState<ViewState | null>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const [grabbing, setGrabbing] = useState(false);
+  const [panTool, setPanTool] = useState(false);
+  const spaceKey = raster ? `${raster.page}:${raster.userWidth ?? raster.width}x${raster.userHeight ?? raster.height}` : "";
+  const [seenSpace, setSeenSpace] = useState(spaceKey);
+  if (spaceKey !== seenSpace) {
+    setSeenSpace(spaceKey);
+    if (viewMode.current !== "user") viewMode.current = "page";
+    userView.current = viewMode.current === "user";
+    if (viewMode.current !== "user") {
+      setView(null);
+    }
+    setImage(null);
+    setImagePage(null);
+    setImageUrl(null);
+  }
+  if (seenStationId.current !== station?.id) {
+    seenStationId.current = station?.id ?? null;
+    viewMode.current = station ? "section" : "page";
+    userView.current = false;
+  }
+
+  const coordW = raster?.userWidth ?? image?.naturalWidth ?? 0;
+  const coordH = raster?.userHeight ?? image?.naturalHeight ?? 0;
 
   viewRef.current = view;
   imageRef.current = image;
+  const coordRef = useRef({ w: 0, h: 0 });
+  coordRef.current = { w: coordW, h: coordH };
 
   useEffect(() => {
-    userView.current = false;
-    setView(null);
-    setCursor(null);
+    const node = moveOverlayRef.current;
+    if (!node) return;
+    const onDismiss = () => onCancelMove();
+    node.addEventListener("gprc-dismiss", onDismiss);
+    return () => node.removeEventListener("gprc-dismiss", onDismiss);
+  }, [onCancelMove, move]);
+
+  useEffect(() => {
     if (!raster) {
       setImage(null);
       setImagePage(null);
+      setImageUrl(null);
       return;
     }
     const page = raster.page;
+    const url = raster.url;
     let cancelled = false;
     const img = new Image();
     img.onload = () => {
       if (cancelled) return;
       setImage(img);
       setImagePage(page);
+      setImageUrl(url);
     };
-    img.src = raster.url;
+    img.src = url;
     return () => {
       cancelled = true;
     };
@@ -130,9 +194,27 @@ export function CrossSectionPanel({
   }, []);
 
   useEffect(() => {
-    if (!image || userView.current || size.w < 8 || size.h < 8) return;
-    setView(fitView(size.w, size.h, image.naturalWidth, image.naturalHeight));
-  }, [image, size]);
+    if (viewMode.current !== "page") return;
+    if (!image || size.w < 8 || size.h < 8 || coordW < 1 || coordH < 1) return;
+    userView.current = false;
+    setView(fitView(size.w, size.h, coordW, coordH));
+  }, [image, size, coordW, coordH]);
+
+  const stationId = station?.id ?? null;
+  useEffect(() => {
+    if (viewMode.current !== "section" || !station) return;
+    if (size.w < 8 || size.h < 8 || coordW < 1 || coordH < 1) return;
+    if (station.pageNumber != null && raster && raster.page !== station.pageNumber) return;
+    const framed = framePoints(size.w, size.h, sectionPixels(station));
+    if (!framed) {
+      viewMode.current = "page";
+      userView.current = false;
+      setView(fitView(size.w, size.h, coordW, coordH));
+      return;
+    }
+    userView.current = true;
+    setView(framed);
+  }, [stationId, raster, size, coordW, coordH]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -143,8 +225,10 @@ export function CrossSectionPanel({
       if (!current || !img) return;
       event.preventDefault();
       userView.current = true;
+      viewMode.current = "user";
       const css = clientToCanvasCss(event.clientX, event.clientY, canvasBox(canvas));
-      const min = fitView(canvas.clientWidth, canvas.clientHeight, img.naturalWidth, img.naturalHeight).scale * 0.5;
+      const space = coordRef.current;
+      const min = fitView(canvas.clientWidth, canvas.clientHeight, space.w || img.naturalWidth, space.h || img.naturalHeight).scale * 0.5;
       setView(zoomAt(current, css, event.deltaY > 0 ? 0.9 : 1.1, min, 16));
     };
     canvas.addEventListener("wheel", onWheel, { passive: false });
@@ -167,7 +251,8 @@ export function CrossSectionPanel({
     ctx.fillRect(0, 0, cssW, cssH);
 
     // The image must be the page this raster was rendered for. A stale image from the previous page is not drawn.
-    const imageIsThisPage = raster != null && image != null && view != null && imagePage === raster.page;
+    const imageIsThisPage =
+      raster != null && image != null && view != null && imagePage === raster.page && imageUrl === raster.url;
     if (!imageIsThisPage || !image || !view) {
       ctx.fillStyle = "#8a8f98";
       ctx.font = "13px ui-sans-serif, system-ui, sans-serif";
@@ -177,10 +262,11 @@ export function CrossSectionPanel({
       return;
     }
 
-    ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(image, view.originX, view.originY, image.naturalWidth * view.scale, image.naturalHeight * view.scale);
-    const showMarks = marksMatchRenderedPage(station?.pageNumber ?? null, raster.page);
-    if (!showMarks) return;
+    const renderScale = raster.renderScale ?? 1;
+    ctx.imageSmoothingEnabled = renderScale / Math.max(view.scale, 1e-6) < 1;
+    const drawW = (raster.userWidth ?? image.naturalWidth) * view.scale;
+    const drawH = (raster.userHeight ?? image.naturalHeight) * view.scale;
+    ctx.drawImage(image, view.originX, view.originY, drawW, drawH);
     const toCss = (px: number, py: number) => ({
       x: view.originX + px * view.scale,
       y: view.originY + py * view.scale,
@@ -188,19 +274,42 @@ export function CrossSectionPanel({
     const transform = station?.calibration.transform;
     const movingGroup = move != null && station != null && move.stationId === station.id;
     const groupPoints = movingGroup ? translateGroup(move.origin, move.dx, move.dy) : station?.calibration.points;
+    // A reuse drag has to stay visible on the page it is being placed onto.
+    if (movingGroup && groupPoints) drawCalibrationGroup(ctx, groupPoints, toCss, true, null);
+    const showMarks = marksMatchRenderedPage(station?.pageNumber ?? null, raster.page);
+    if (!showMarks) return;
     if (transform && station) {
+      const selectedExisting = selectedPoint?.key === "existing" ? selectedPoint : undefined;
+      const selectedProposed = selectedPoint?.key === "proposed" ? selectedPoint : undefined;
       const activeExisting = mode === "existing" ? station.existing[station.existing.length - 1] : undefined;
       const activeProposed = mode === "proposed" ? station.proposed[station.proposed.length - 1] : undefined;
-      strokeProfile(ctx, displayProfile(station.existing), "#7dd3fc", true, transform, toCss, activeExisting);
-      strokeProfile(ctx, displayProfile(station.proposed), "#fbbf24", false, transform, toCss, activeProposed);
+      strokeProfile(ctx, displayProfile(station.existing), "#7dd3fc", true, transform, toCss, activeExisting, selectedExisting);
+      strokeProfile(ctx, displayProfile(station.proposed), "#fbbf24", false, transform, toCss, activeProposed, selectedProposed);
     }
-    if (groupPoints) drawCalibrationGroup(ctx, groupPoints, toCss, movingGroup, mode === "calibrate" && !movingGroup ? pickIdx : null);
-  }, [raster, image, imagePage, view, station, mode, pickIdx, loading, size, move]);
+    if (!movingGroup && groupPoints) drawCalibrationGroup(ctx, groupPoints, toCss, false, mode === "calibrate" ? pickIdx : null);
+  }, [raster, image, imagePage, imageUrl, view, station, mode, pickIdx, loading, size, move, selectedPoint]);
+
+  useEffect(() => {
+    const userWidth = raster?.userWidth;
+    const userHeight = raster?.userHeight;
+    const renderScale = raster?.renderScale;
+    if (!onDisplayScale || !view || !userWidth || !userHeight || renderScale == null) return;
+    const scale = view.scale;
+    const handle = window.setTimeout(() => {
+      const next = Math.max(displayRenderScale(userWidth, userHeight, scale, window.devicePixelRatio || 1), legacyRasterScale(userWidth, userHeight));
+      if (Math.abs(next - renderScale) > 0.05) onDisplayScale(next);
+    }, 200);
+    return () => window.clearTimeout(handle);
+  }, [onDisplayScale, view, raster]);
 
   const calibrated = isCalibrated(station);
   const moving = move != null && station != null && move.stationId === station.id;
   const areas = computeAreas(station);
-  const canUndo = (mode === "existing" && (station?.existing.length ?? 0) > 0) || (mode === "proposed" && (station?.proposed.length ?? 0) > 0);
+  const canUndo =
+    undoCount > 0 ||
+    (mode === "existing" && (station?.existing.length ?? 0) > 0) ||
+    (mode === "proposed" && (station?.proposed.length ?? 0) > 0) ||
+    (mode === "insert" && (station?.[insertKey].length ?? 0) > 0);
   let readout = "—";
   if (cursor && station?.calibration.transform) {
     let { offset, elevation } = pxToReal(station.calibration.transform, cursor.x, cursor.y);
@@ -216,7 +325,9 @@ export function CrossSectionPanel({
     const img = imageRef.current;
     if (!canvas || !img) return;
     userView.current = false;
-    setView(fitView(canvas.clientWidth, canvas.clientHeight, img.naturalWidth, img.naturalHeight));
+    viewMode.current = "page";
+    const space = coordRef.current;
+    setView(fitView(canvas.clientWidth, canvas.clientHeight, space.w || img.naturalWidth, space.h || img.naturalHeight));
   };
 
   const pointerCss = (event: { clientX: number; clientY: number }, canvas: HTMLCanvasElement) =>
@@ -253,11 +364,31 @@ export function CrossSectionPanel({
         <button type="button" onClick={fit} className="rounded bg-white/10 px-2 py-1 text-[11px]">
           Fit
         </button>
+        <button
+          type="button"
+          aria-pressed={panTool}
+          onClick={() => setPanTool((current) => !current)}
+          className={cn("rounded px-2 py-1 text-[11px]", panTool ? "bg-accent text-black" : "bg-white/10")}
+        >
+          Pan
+        </button>
+        {onToggleExpand && (
+          <button type="button" onClick={onToggleExpand} className="rounded bg-white/10 px-2 py-1 text-[11px]">
+            {expanded ? "Exit" : "Expand"}
+          </button>
+        )}
         <ModeButton active={mode === "existing"} disabled={!calibrated} onClick={() => onMode("existing")}>
           Existing
         </ModeButton>
         <ModeButton active={mode === "proposed"} disabled={!calibrated} onClick={() => onMode("proposed")}>
           Proposed
+        </ModeButton>
+        <ModeButton
+          active={mode === "insert"}
+          disabled={!calibrated || ((station?.existing.length ?? 0) < 2 && (station?.proposed.length ?? 0) < 2)}
+          onClick={() => onMode(mode === "insert" ? insertKey : "insert")}
+        >
+          Insert
         </ModeButton>
         <button type="button" disabled={!canUndo} onClick={onUndo} className="rounded bg-white/10 px-2 py-1 text-[11px] disabled:opacity-40">
           Undo
@@ -276,14 +407,17 @@ export function CrossSectionPanel({
           type="button"
           disabled={!canReuse}
           onClick={onStartMove}
-          title={canReuse ? "Drag a finished calibration triangle onto this cross-section" : "Calibrate a station on this page first"}
+          title={canReuse ? "Drag a calibration here. Same scale only — Recalibrate if this sheet’s scale differs." : "Calibrate a station first"}
           className={cn("rounded px-2 py-1 text-[11px] disabled:opacity-40", moving ? "bg-accent text-black" : "bg-white/10")}
         >
           Reuse
         </button>
-        <span className="ml-auto font-mono text-[11px] text-cut">Cut {areas ? areas.cut.toFixed(1) : "—"}</span>
+        <span className="ml-auto font-mono text-[11px] text-foreground" data-active-station={station?.id ?? ""}>
+          {station?.name ?? "No station"}
+        </span>
+        <span className="font-mono text-[11px] text-cut">Cut {areas ? areas.cut.toFixed(1) : "—"}</span>
         <span className="font-mono text-[11px] text-fill">Fill {areas ? areas.fill.toFixed(1) : "—"}</span>
-        <span className="font-mono text-[11px] text-muted">{cursor ? readout : station?.name ?? ""}</span>
+        <span className="font-mono text-[11px] text-muted">{cursor ? readout : ""}</span>
       </div>
       {error && <div className="truncate px-2 py-0.5 text-[11px] text-amber-200">{error}</div>}
       {pageMismatch && (
@@ -298,16 +432,16 @@ export function CrossSectionPanel({
           )}
         </div>
       )}
-      <div className="relative min-h-0 flex-1">
+      <div className="relative min-h-0 flex-1" data-section-station={station?.id ?? ""} data-section-page={raster?.page ?? ""}>
         <canvas
           ref={canvasRef}
-          className={cn("h-full w-full touch-none", moving && (grabbing ? "cursor-grabbing" : "cursor-grab"))}
+          className={cn("h-full w-full touch-none", grabbing || panTool || spacePan ? (grabbing ? "cursor-grabbing" : "cursor-grab") : "cursor-crosshair")}
           onContextMenu={(event) => event.preventDefault()}
           onPointerDown={(event) => {
             const box = canvasBox(event.currentTarget);
             const css = clientToCanvasCss(event.clientX, event.clientY, box);
             const current = viewRef.current;
-            const panning = event.button === 1 || event.button === 2 || event.altKey || event.shiftKey;
+            const panning = event.button === 1 || event.button === 2 || event.altKey || event.shiftKey || panTool || spacePan;
             if (!panning && moving && move && current) {
               const img = cssToImage(css, current);
               const preview = translateGroup(move.origin, move.dx, move.dy);
@@ -348,10 +482,14 @@ export function CrossSectionPanel({
             if (!drag?.panning || !current) return;
             const dx = css.x - drag.x;
             const dy = css.y - drag.y;
-            if (Math.hypot(dx, dy) > 2) drag.moved = true;
+            if (Math.hypot(dx, dy) > 2) {
+              drag.moved = true;
+              viewMode.current = "user";
+            }
             drag.x = css.x;
             drag.y = css.y;
             userView.current = true;
+            viewMode.current = "user";
             setView(pan(current, dx, dy));
           }}
           onPointerUp={(event) => {
@@ -362,21 +500,64 @@ export function CrossSectionPanel({
             }
             const drag = dragRef.current;
             dragRef.current = null;
-            if (!drag || drag.panning || drag.moved || moving) return;
+            if (!drag || drag.panning || drag.moved || moving || panTool || spacePan) return;
             const css = pointerCss(event, event.currentTarget);
             if (Math.hypot(css.x - drag.x, css.y - drag.y) > 4) return;
             const current = viewRef.current;
             if (!current) return;
             const img = cssToImage(css, current);
+            if ((mode === "existing" || mode === "proposed") && station?.calibration.transform && onSelectPoint) {
+              const sorted = displayProfile(station[mode]);
+              let nearest: ProfilePoint | null = null;
+              let nearestDist = 10;
+              for (const point of sorted) {
+                const raw = realToPx(station.calibration.transform, point.offset, point.elevation);
+                const at = { x: current.originX + raw.px * current.scale, y: current.originY + raw.py * current.scale };
+                const dist = Math.hypot(at.x - css.x, at.y - css.y);
+                if (dist <= nearestDist) {
+                  nearest = point;
+                  nearestDist = dist;
+                }
+              }
+              if (nearest) {
+                onSelectPoint({ key: mode, offset: nearest.offset, elevation: nearest.elevation });
+                return;
+              }
+            }
+            if (mode === "insert" && station?.calibration.transform && onInsert) {
+              const key = insertKey;
+              const sorted = displayProfile(station[key]);
+              const pixels = sorted.map((point) => {
+                const raw = realToPx(station.calibration.transform!, point.offset, point.elevation);
+                return { x: raw.px, y: raw.py };
+              });
+              const hit = nearestSegment(pixels, img.x, img.y, 14 / Math.max(current.scale, 1e-6));
+              if (!hit || hit.t <= 1e-3 || hit.t >= 1 - 1e-3) return;
+              let real = pxToReal(station.calibration.transform, hit.x, hit.y);
+              if (snap) {
+                const snapped = { offset: Math.round(real.offset), elevation: Math.round(real.elevation) };
+                const start = sorted[hit.index];
+                const end = sorted[hit.index + 1];
+                const min = Math.min(start.offset, end.offset);
+                const max = Math.max(start.offset, end.offset);
+                if (snapped.offset > min && snapped.offset < max) real = snapped;
+              }
+              onInsert(key, hit.index, real.offset, real.elevation);
+              return;
+            }
             onPick(img.x, img.y);
           }}
           onPointerLeave={() => setCursor(null)}
         />
         {moving && (
-          <div className="absolute left-2 top-2 z-10 max-w-sm rounded-md border border-[#7f1d1d]/60 bg-[#101214]/95 px-3 py-2 shadow-lg">
+          <div
+            ref={moveOverlayRef}
+            data-overlay="move"
+            className="absolute left-2 top-2 z-10 max-w-sm rounded-md border border-[#7f1d1d]/60 bg-[#101214]/95 px-3 py-2 shadow-lg"
+          >
             <div className="text-[11px] font-medium tracking-wide text-[#fecaca]">Move calibration</div>
             <p className="mt-0.5 text-[11px] leading-snug text-muted">
-              Drag the triangle onto this station’s cross-section. Offset and elevation stay the same.
+              Drag the triangle onto this cross-section. Offset and elevation stay the same. Recalibrate if the sheet scale differs.
             </p>
             <div className="mt-2 flex gap-1.5">
               <button type="button" onClick={onConfirmMove} className="rounded bg-accent px-2 py-1 text-[11px] font-medium text-black">
@@ -485,6 +666,7 @@ function strokeProfile(
   transform: NonNullable<Station["calibration"]["transform"]>,
   toCss: (px: number, py: number) => { x: number; y: number },
   active?: ProfilePoint,
+  selected?: { offset: number; elevation: number },
 ) {
   if (points.length === 0) return;
   ctx.beginPath();
@@ -504,7 +686,9 @@ function strokeProfile(
   for (const point of points) {
     const raw = realToPx(transform, point.offset, point.elevation);
     const css = toCss(raw.px, raw.py);
-    const hot = point === active;
+    const hot =
+      point === active ||
+      (selected != null && Math.abs(point.offset - selected.offset) < 1e-6 && Math.abs(point.elevation - selected.elevation) < 1e-6);
     ctx.beginPath();
     ctx.arc(css.x, css.y, hot ? 4 : 2.5, 0, Math.PI * 2);
     ctx.fillStyle = color;

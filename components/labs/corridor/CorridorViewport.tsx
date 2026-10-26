@@ -7,6 +7,7 @@ import type { Material, PerspectiveCamera, WebGLRenderer } from "three";
 import { referenceScale, type PlanAlignment } from "@/lib/corridor/alignment";
 import { buildAlignedCorridorGeometry } from "@/lib/corridor/alignment-geometry";
 import { buildCorridorGeometry } from "@/lib/corridor/corridor-geometry";
+import { nextNavMode } from "@/lib/corridor/nav";
 import { isSectionReady } from "@/lib/corridor/stations";
 import type { CorridorVisibility, Station } from "@/lib/corridor/types";
 import { cn } from "@/lib/utils";
@@ -430,11 +431,13 @@ export function CorridorViewport({
     return () => window.clearTimeout(timer);
   }, [navMode]);
 
-  const chooseNav = (mode: "orbit" | "roam") => {
-    if (mode === navMode) return;
-    navModeRef.current = mode;
-    setNavMode(mode);
-    actionsRef.current.setNav(mode);
+  const chooseNav = (requested: "orbit" | "roam") => {
+    const next = nextNavMode(navMode, requested);
+    if (next.mode === navMode && !next.frame) return;
+    navModeRef.current = next.mode;
+    setNavMode(next.mode);
+    actionsRef.current.setNav(next.mode);
+    if (next.frame) actionsRef.current.reset();
   };
 
   const ready = stations.filter(isSectionReady).length;
@@ -443,6 +446,7 @@ export function CorridorViewport({
     <div
       ref={wrapRef}
       className={cn("relative h-full min-h-[320px] min-w-0 bg-[#0b0c0e]", fullscreen && "fixed inset-0 z-50")}
+      data-nav={navMode}
     >
       <canvas ref={canvasRef} className="block h-full w-full touch-none" onContextMenu={(event) => event.preventDefault()} />
       <div
@@ -480,6 +484,7 @@ export function CorridorViewport({
         </button>
         <button
           type="button"
+          aria-pressed={navMode === "roam"}
           onClick={() => chooseNav("roam")}
           className={cn("rounded px-2 py-1 text-[11px]", navMode === "roam" ? "bg-accent text-black" : "bg-white/10")}
         >

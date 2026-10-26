@@ -36,6 +36,7 @@ function station(value: unknown): Station {
     existing: raw.existing ?? [],
     proposed: raw.proposed ?? [],
     alignmentRef: { centerlineId: raw.alignmentRef?.centerlineId ?? null },
+    ...(raw.pdfSpace === "pdf-user" ? { pdfSpace: "pdf-user" as const } : {}),
   };
 }
 

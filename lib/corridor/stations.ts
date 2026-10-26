@@ -58,6 +58,7 @@ export function createStation(name: string): Station | null {
     existing: [],
     proposed: [],
     alignmentRef: { centerlineId: null },
+    pdfSpace: "pdf-user",
   };
 }
 
@@ -71,15 +72,21 @@ function groupIsPlaced(station: Station) {
   );
 }
 
-/** Station whose triangle can be dragged onto the active station. Same PDF page only. */
+/**
+ * Station whose triangle can be dragged onto the active station.
+ * A placed active station is repositioned in place. Otherwise the nearest calibrated
+ * station is offered, including one marked on another page. The caller still has to
+ * confirm the drag. A different sheet scale is Recalibrate, not this copy.
+ */
 export function reuseSource(stations: readonly Station[], active: Station, pageNumber: number): Station | null {
   if (groupIsPlaced(active)) return active;
-  const donors = stations.filter(
-    (station) => station.id !== active.id && groupIsPlaced(station) && station.pageNumber === pageNumber,
-  );
-  donors.sort(
-    (a, b) => Math.abs(a.stationFt - active.stationFt) - Math.abs(b.stationFt - active.stationFt) || a.name.localeCompare(b.name),
-  );
+  const donors = stations.filter((station) => station.id !== active.id && groupIsPlaced(station));
+  donors.sort((a, b) => {
+    const distance = Math.abs(a.stationFt - active.stationFt) - Math.abs(b.stationFt - active.stationFt);
+    if (distance !== 0) return distance;
+    const page = Number(a.pageNumber !== pageNumber) - Number(b.pageNumber !== pageNumber);
+    return page || a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+  });
   return donors[0] ?? null;
 }
 

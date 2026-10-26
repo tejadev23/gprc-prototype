@@ -21,7 +21,9 @@ function pairScale(
   return null;
 }
 
-/** Solve an axis-aligned pixel ↔ offset/elevation transform. Null when the three points do not span both axes. */
+/** Solve an axis-aligned pixel ↔ offset/elevation transform. Null when the three points do not span both axes.
+ *  A two-point known distance (`knownDistanceScale`) can check this scale. It does not replace the transform.
+ */
 export function solveTransform(points: readonly CalibPoint[]): AxisTransform | null {
   if (points.length < 3) return null;
   const sample = points.slice(0, 3);

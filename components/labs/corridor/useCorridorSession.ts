@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { applyCalibration, nextUnsetPixel, pxToReal, translateGroup, withPixelPick, type CalibrationMove } from "@/lib/corridor/calibration";
+import { acceptPageRaster, viewForStation } from "@/lib/corridor/section-sync";
 import { decidePick, rasterIsCurrent, resolveStationPage } from "@/lib/corridor/page-ref";
+import { insertOnDisplaySegment } from "@/lib/corridor/profile";
 import { addProfilePoint, blankCalibPoint, createStation, reuseSource } from "@/lib/corridor/stations";
 import {
   createProject,
@@ -20,11 +22,22 @@ import {
   type ProjectSummary,
   type SaveState,
 } from "@/lib/corridor/storage";
-import type { CalibPoint, CorridorVisibility, DockTab, Station, TraceMode } from "@/lib/corridor/types";
+import type { CalibPoint, CorridorVisibility, DockTab, ProfilePoint, Station, TraceMode } from "@/lib/corridor/types";
+import { legacyRasterScale, migrateStationsToPdfUser } from "@/lib/corridor/pdf-space";
 import { openPdfDocument, renderPdfPage } from "@/lib/labs/pdf-raster";
 
 /** `doc` and `page` say which sheet this image was rendered for, so a stale one is never shown. */
-export type CorridorRaster = { url: string; width: number; height: number; doc: PDFDocumentProxy; page: number };
+export type CorridorRaster = {
+  url: string;
+  /** Bitmap pixels. The drawing coordinate system is `userWidth` / `userHeight`. */
+  width: number;
+  height: number;
+  userWidth: number;
+  userHeight: number;
+  renderScale: number;
+  doc: PDFDocumentProxy;
+  page: number;
+};
 type PdfFile = { name: string; doc: PDFDocumentProxy; numPages: number };
 
 export type CorridorSessionOptions = {
@@ -51,6 +64,15 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
   const [pdfError, setPdfError] = useState<string | null>(null);
   const [pageNotice, setPageNotice] = useState<string | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
+  const [detailScale, setDetailScale] = useState<number | null>(null);
+  const [insertKey, setInsertKey] = useState<"existing" | "proposed">("existing");
+  const [selectedPoint, setSelectedPoint] = useState<{
+    stationId: string;
+    key: "existing" | "proposed";
+    offset: number;
+    elevation: number;
+  } | null>(null);
+  const [undoCount, setUndoCount] = useState(0);
   const [visibility, setVisibility] = useState<CorridorVisibility>({
     existing: true,
     proposed: true,
@@ -66,9 +88,12 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
   const [projectReady, setProjectReady] = useState(false);
   const rasterUrl = useRef<string | null>(null);
   const pdfBlobRef = useRef<Blob | null>(null);
+  const pageRef = useRef(pageNumber);
+  pageRef.current = pageNumber;
   const pdfDirtyRef = useRef(false);
   const skipSaveRef = useRef(true);
   const saveTimerRef = useRef<number | null>(null);
+  const profileUndo = useRef<{ stationId: string; key: "existing" | "proposed"; before: ProfilePoint[] }[]>([]);
   const [createdAt, setCreatedAt] = useState(() => new Date().toISOString());
   const [seenPdf, setSeenPdf] = useState("");
   const pdfKey = pdf ? `${pdf.name}:${pageNumber}` : "";
@@ -128,6 +153,10 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
     setMove(null);
     setPickIdx(null);
     setMode("calibrate");
+    setDetailScale(null);
+    setSelectedPoint(null);
+    profileUndo.current = [];
+    setUndoCount(0);
   }, []);
 
   const applyLoaded = useCallback(async (loaded: { project: EarthworkProject; pdf: Blob | null }) => {
@@ -138,7 +167,6 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
     pdfDirtyRef.current = false;
     setProjectId(project.id);
     setProjectName(project.name);
-    setStations(project.stations);
     setActiveId(project.activeStationId);
     setPageNotice(null);
     // Open on the active station's own page when it has one, not on whichever page was last browsed.
@@ -150,17 +178,30 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
     setSnap(project.snap);
     setMove(null);
     setPickIdx(null);
+    setSelectedPoint(null);
+    profileUndo.current = [];
+    setUndoCount(0);
+    setStations(project.stations);
+    let stations = project.stations;
     if (blob) {
       const doc = await openPdfDocument(await blob.arrayBuffer());
+      try {
+        stations = await migrateStationsToPdfUser(doc, stations);
+      } catch {
+        // Keep the saved pixels if a page cannot be measured. The next open tries again.
+      }
+      setStations(stations);
       setPdf({ name: project.document.name ?? "document.pdf", doc, numPages: doc.numPages });
       if (!Number.isInteger(startPage) || startPage < 1 || startPage > doc.numPages) {
         setPageNumber(1);
-        if (activeStation) {
-          const resolved = resolveStationPage({ name: activeStation.name, pageNumber: startPage }, doc.numPages);
+        const activeAfter = stations.find((station) => station.id === project.activeStationId);
+        if (activeAfter) {
+          const resolved = resolveStationPage({ name: activeAfter.name, pageNumber: startPage }, doc.numPages);
           if (!resolved.ok) setPageNotice(resolved.message);
         }
       }
     } else {
+      setStations(stations);
       setPdf(null);
       setPdfError(project.document.name ? `Reload “${project.document.name}” to see the sheet. Stations and profiles are saved.` : null);
     }
@@ -332,49 +373,52 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
   }, []);
 
   useEffect(() => {
-    if (!fullscreen) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (document.pointerLockElement) return;
-      setFullscreen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [fullscreen]);
-
-  useEffect(() => {
-    return () => {
-      if (rasterUrl.current) URL.revokeObjectURL(rasterUrl.current);
-    };
-  }, []);
-
-  useEffect(() => {
     if (!pdf) {
       if (rasterUrl.current) URL.revokeObjectURL(rasterUrl.current);
       rasterUrl.current = null;
       return;
     }
     let cancelled = false;
-    renderPdfPage(pdf.doc, pageNumber)
-      .then((page) => {
-        if (cancelled) {
-          URL.revokeObjectURL(page.objectUrl);
+    const doc = pdf.doc;
+    const page = pageNumber;
+    (async () => {
+      try {
+        const pdfPage = await doc.getPage(page);
+        const base = pdfPage.getViewport({ scale: 1 });
+        const scale = detailScale ?? legacyRasterScale(base.width, base.height);
+        const rendered = await renderPdfPage(doc, page, { scale });
+        if (cancelled || !acceptPageRaster(page, pageRef.current)) {
+          URL.revokeObjectURL(rendered.objectUrl);
           return;
         }
         if (rasterUrl.current) URL.revokeObjectURL(rasterUrl.current);
-        rasterUrl.current = page.objectUrl;
-        setRaster({ url: page.objectUrl, width: page.width, height: page.height, doc: pdf.doc, page: pageNumber });
-      })
-      .catch((err: unknown) => {
+        rasterUrl.current = rendered.objectUrl;
+        setRaster({
+          url: rendered.objectUrl,
+          width: rendered.width,
+          height: rendered.height,
+          userWidth: rendered.userWidth,
+          userHeight: rendered.userHeight,
+          renderScale: rendered.renderScale,
+          doc,
+          page,
+        });
+      } catch (err: unknown) {
         if (!cancelled) setPdfError(err instanceof Error ? err.message : "Could not render this PDF page.");
-      })
-      .finally(() => {
+      } finally {
         if (!cancelled) setPdfLoading(false);
-      });
+      }
+    })();
     return () => {
       cancelled = true;
     };
-  }, [pdf, pageNumber]);
+  }, [pdf, pageNumber, detailScale]);
+
+  useEffect(() => {
+    return () => {
+      if (rasterUrl.current) URL.revokeObjectURL(rasterUrl.current);
+    };
+  }, []);
 
   const loadPdf = async (file: File) => {
     setPdfError(null);
@@ -384,12 +428,14 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
       pdfBlobRef.current = new Blob([bytes], { type: "application/pdf" });
       pdfDirtyRef.current = true;
       const doc = await openPdfDocument(await pdfBlobRef.current.arrayBuffer());
+      const migrated = await migrateStationsToPdfUser(doc, stations);
+      setStations(migrated);
       setPdf({ name: file.name, doc, numPages: doc.numPages });
-      setPageNumber(1);
-      setMove((current) => (current && current.pageNumber !== 1 ? null : current));
-      if (activeId) {
-        patchStation(activeId, (station) => (station.pageNumber == null ? { ...station, pageNumber: 1 } : station));
-      }
+      const active = stations.find((station) => station.id === activeId);
+      const next = active ? viewForStation(active, doc.numPages, 1) : { page: 1, notice: null };
+      setPageNumber(next.page);
+      setPageNotice(next.notice);
+      setMove((current) => (current && current.pageNumber !== next.page ? null : current));
     } catch (err: unknown) {
       setPdfError(err instanceof Error ? err.message : "Could not open that PDF.");
       setPdfLoading(false);
@@ -400,17 +446,11 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
     const station = stations.find((item) => item.id === id);
     if (!station) return;
     setActiveId(id);
-    // Show the station's own page. Selecting never writes a page into the station.
-    const resolved = resolveStationPage(station, pdf?.numPages ?? null);
-    let nextPage = pageNumber;
-    if (resolved.ok) {
-      nextPage = resolved.page;
-      setPageNumber(resolved.page);
-      setPageNotice(null);
-    } else {
-      setPageNotice(resolved.reason === "no-page" ? null : resolved.message);
-    }
-    setMove((current) => (current && (current.stationId !== id || current.pageNumber !== nextPage) ? null : current));
+    const next = viewForStation(station, pdf?.numPages ?? null, pageNumber);
+    setPageNumber(next.page);
+    setPageNotice(next.notice);
+    setMove((current) => (current && (current.stationId !== id || current.pageNumber !== next.page) ? null : current));
+    setSelectedPoint(null);
     if (station.calibration.transform) {
       setMode((current) => (current === "existing" || current === "proposed" ? current : "existing"));
       setPickIdx(null);
@@ -457,8 +497,14 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
     goPage(active.pageNumber);
   };
 
+  const rememberProfile = (station: Station, key: "existing" | "proposed") => {
+    profileUndo.current.push({ stationId: station.id, key, before: station[key].map((point) => ({ ...point })) });
+    if (profileUndo.current.length > 50) profileUndo.current.shift();
+    setUndoCount(profileUndo.current.length);
+  };
+
   const onCanvasPick = (px: number, py: number) => {
-    if (!active) return;
+    if (!active || mode === "insert") return;
     const decision = decidePick(active, pageNumber);
     if (!decision.allow) {
       setPageNotice(decision.message);
@@ -487,12 +533,57 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
       elevation = Math.round(elevation);
     }
     const key = mode;
+    setSelectedPoint(null);
+    rememberProfile(active, key);
     patchStation(active.id, (station) =>
       stamp({
         ...station,
         [key]: addProfilePoint(station[key], offset, elevation),
       }),
     );
+  };
+
+  const insertProfile = (key: "existing" | "proposed", segmentIndex: number, offset: number, elevation: number) => {
+    if (!active || !active.calibration.transform) return;
+    const decision = decidePick(active, pageNumber);
+    if (!decision.allow) {
+      setPageNotice(decision.message);
+      return;
+    }
+    if (active[key].length < 2) return;
+    setPageNotice(null);
+    const stamp = (station: Station): Station => (decision.assignPage ? { ...station, pageNumber } : station);
+    setSelectedPoint(null);
+    rememberProfile(active, key);
+    patchStation(active.id, (station) =>
+      stamp({
+        ...station,
+        [key]: insertOnDisplaySegment(station[key], segmentIndex, { offset, elevation }),
+      }),
+    );
+  };
+
+  const selectProfilePoint = (point: { key: "existing" | "proposed"; offset: number; elevation: number } | null) => {
+    if (!active || !point) {
+      setSelectedPoint(null);
+      return;
+    }
+    setSelectedPoint({ stationId: active.id, ...point });
+  };
+
+  const deleteSelectedProfile = () => {
+    if (!selectedPoint || selectedPoint.stationId !== activeId) return false;
+    const station = stations.find((item) => item.id === selectedPoint.stationId);
+    if (!station) return false;
+    const key = selectedPoint.key;
+    const next = station[key].filter(
+      (point) => Math.abs(point.offset - selectedPoint.offset) >= 1e-6 || Math.abs(point.elevation - selectedPoint.elevation) >= 1e-6,
+    );
+    if (next.length === station[key].length) return false;
+    rememberProfile(station, key);
+    patchStation(station.id, (current) => ({ ...current, [key]: next }));
+    setSelectedPoint(null);
+    return true;
   };
 
   const changeCalib = (index: number, patch: Partial<CalibPoint>) => {
@@ -525,13 +616,9 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
 
   const startMove = () => {
     if (!active || move) return;
-    const decision = decidePick(active, pageNumber);
-    if (!decision.allow) {
-      setPageNotice(decision.message);
-      return;
-    }
     const source = reuseSource(stations, active, pageNumber);
     if (!source) return;
+    setPageNotice(null);
     setMove({
       stationId: active.id,
       pageNumber,
@@ -546,7 +633,12 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
     if (!move || move.stationId !== activeId) return;
     const points = translateGroup(move.origin, move.dx, move.dy);
     const movePage = move.pageNumber;
-    patchStation(move.stationId, (station) => ({ ...station, calibration: applyCalibration(points), pageNumber: movePage }));
+    patchStation(move.stationId, (station) => ({
+      ...station,
+      calibration: applyCalibration(points),
+      pageNumber: movePage,
+      pdfSpace: "pdf-user",
+    }));
     setMove(null);
     setMode("existing");
     setPickIdx(null);
@@ -566,17 +658,44 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
   };
 
   const undoPoint = () => {
-    if (!active || (mode !== "existing" && mode !== "proposed")) return;
-    const key = mode;
+    const snap = profileUndo.current.pop();
+    if (snap) {
+      setUndoCount(profileUndo.current.length);
+      patchStation(snap.stationId, (station) => ({ ...station, [snap.key]: snap.before }));
+      setSelectedPoint(null);
+      return;
+    }
+    if (!active) return;
+    const key = mode === "insert" ? insertKey : mode === "existing" || mode === "proposed" ? mode : null;
+    if (!key || active[key].length === 0) return;
     patchStation(active.id, (station) => ({ ...station, [key]: station[key].slice(0, -1) }));
+  };
+
+  const cancelInsert = () => {
+    if (mode === "insert") setMode(insertKey);
   };
 
   const setTraceMode = (next: TraceMode) => {
     if (!active) return;
+    if (next === "insert") {
+      if (!active.calibration.transform) return;
+      const preferred = mode === "proposed" || mode === "existing" ? mode : insertKey;
+      const key = active[preferred].length >= 2 ? preferred : active.existing.length >= 2 ? "existing" : "proposed";
+      if (active[key].length < 2) return;
+      setInsertKey(key);
+      setMode("insert");
+      setPickIdx(null);
+      return;
+    }
     if ((next === "existing" || next === "proposed") && !active.calibration.transform) return;
+    if (next === "existing" || next === "proposed") setInsertKey(next);
     setMode(next);
     if (next === "calibrate") setPickIdx(nextUnsetPixel(active.calibration.points));
     else setPickIdx(null);
+  };
+
+  const requestPdfDetail = (scale: number) => {
+    setDetailScale((current) => (current != null && Math.abs(current - scale) < 0.05 ? current : scale));
   };
 
   return {
@@ -632,7 +751,15 @@ export function useCorridorSession(options?: CorridorSessionOptions) {
     cancelMove,
     resetCalibration,
     undoPoint,
+    undoCount,
     setTraceMode,
+    insertKey,
+    insertProfile,
+    selectProfilePoint,
+    selectedPoint,
+    deleteSelectedProfile,
+    cancelInsert,
+    requestPdfDetail,
   };
 }
 

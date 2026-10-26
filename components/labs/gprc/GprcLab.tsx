@@ -2,6 +2,7 @@
 
 import { Menu } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { PDFDocumentProxy } from "pdfjs-dist";
 import { BottomDock } from "@/components/labs/corridor/BottomDock";
 import { CorridorViewport } from "@/components/labs/corridor/CorridorViewport";
 import { ProjectDrawer } from "@/components/labs/corridor/ProjectDrawer";
@@ -12,6 +13,7 @@ import { GeoreferencePanel } from "@/components/labs/gprc/GeoreferencePanel";
 import { GprcGuide } from "@/components/labs/gprc/GprcGuide";
 import { KmzExportPanel } from "@/components/labs/gprc/KmzExportPanel";
 import { StationReferencePanel } from "@/components/labs/gprc/StationReferencePanel";
+import { adoptPdfPlanSpace, legacyRasterScale } from "@/lib/corridor/pdf-space";
 import { chainageDistance, emptyAlignment, referenceScale, type AlignmentMarker, type PlanAlignment } from "@/lib/corridor/alignment";
 import { normalizeKmzOptions, type KmzOptions } from "@/lib/corridor/kmz/options";
 import { defaultGeoref, type ControlPoint, type Georef } from "@/lib/corridor/georef/model";
@@ -29,9 +31,10 @@ import {
   type GprcView,
 } from "@/lib/corridor/storage";
 import { openPdfDocument, renderPdfPage } from "@/lib/labs/pdf-raster";
+import { isEditableTarget, resolveShortcut } from "@/lib/ui/shortcuts";
 import { cn } from "@/lib/utils";
 
-type PlanRaster = { url: string; width: number; height: number };
+type PlanRaster = { url: string; width: number; height: number; renderScale?: number };
 
 const sessionOptions = { startup: "manual", touchLast: false } as const;
 
@@ -49,10 +52,16 @@ export function GprcLab() {
   const [storedGeoref, setStoredGeoref] = useState<Georef | null>(null);
   const [exportOptions, setExportOptions] = useState<KmzOptions>(() => normalizeKmzOptions(null));
   const [dock, setDock] = useState<"stations" | "georef" | "export" | null>("stations");
+  const [expandedPane, setExpandedPane] = useState<GprcPane | null>(null);
+  const [spacePan, setSpacePan] = useState(false);
+  const [planDetail, setPlanDetail] = useState<number | null>(null);
   const [selectedControlId, setSelectedControlId] = useState<string | null>(null);
   const [pickingControlId, setPickingControlId] = useState<string | null>(null);
   const [trackedProjectId, setTrackedProjectId] = useState<string | null>(projectId);
   const planUrl = useRef<string | null>(null);
+  const planDocRef = useRef<PDFDocumentProxy | null>(null);
+  const planUndoRef = useRef<(() => void) | null>(null);
+  const planDeleteRef = useRef<(() => boolean) | null>(null);
   const recordRef = useRef<GprcRecord>(emptyGprcRecord());
   // Markers follow their station records by station value. Derived on every render, so a record that is
   // added, deleted or re-created never leaves a marker pointing at nothing.
@@ -72,6 +81,9 @@ export function GprcLab() {
     setSelectedControlId(null);
     setPickingControlId(null);
     setGprcReady(false);
+    setExpandedPane(null);
+    setPlanDetail(null);
+    planDocRef.current = null;
     if (!projectId) setPane("plan");
   }
 
@@ -104,14 +116,35 @@ export function GprcLab() {
           setPlan(null);
           return;
         }
-        const raster = await rasterizePlan(blob, record.planFileName ?? "plan", record.planMime ?? blob.type);
+        const opened = await openPlanRaster(blob, record.planFileName ?? "plan", record.planMime ?? blob.type);
         if (cancelled) {
-          URL.revokeObjectURL(raster.url);
+          URL.revokeObjectURL(opened.raster.url);
           return;
         }
+        planDocRef.current = opened.doc;
+        if (opened.kind === "pdf") {
+          const adopted = adoptPdfPlanSpace({
+            planSpace: record.planSpace,
+            alignment: record.alignment,
+            georef: record.georef,
+            userWidth: opened.raster.width,
+            userHeight: opened.raster.height,
+          });
+          setAlignment(adopted.alignment);
+          setStoredGeoref(adopted.georef);
+          if (adopted.changed) {
+            const next = { ...record, alignment: adopted.alignment, georef: adopted.georef, planSpace: "pdf-user" as const };
+            recordRef.current = next;
+            void saveGprcRecord(id, next);
+          }
+        } else if (record.planSpace !== "image") {
+          const next = { ...recordRef.current, planSpace: "image" as const };
+          recordRef.current = next;
+          void saveGprcRecord(id, next);
+        }
         if (planUrl.current) URL.revokeObjectURL(planUrl.current);
-        planUrl.current = raster.url;
-        setPlan({ url: raster.url, width: raster.width, height: raster.height });
+        planUrl.current = opened.raster.url;
+        setPlan(opened.raster);
         setPlanName(record.planFileName);
       } catch (err) {
         if (!cancelled) setPlanError(err instanceof Error ? err.message : "Could not open the stitched plan.");
@@ -176,6 +209,7 @@ export function GprcLab() {
 
   const selectPane = (next: GprcPane) => {
     setPane(next);
+    setExpandedPane((current) => (current ? next : null));
     persistRecord({ ...recordRef.current, pane: next });
   };
 
@@ -296,13 +330,20 @@ export function GprcLab() {
         planMime: mime,
         alignment: nextAlignment,
         georef: recordRef.current.georef ? { ...recordRef.current.georef, points: [], raster: null } : null,
+        planSpace: null,
       };
       recordRef.current = record;
       await saveGprcRecord(id, record);
-      const raster = await rasterizePlan(blob, file.name, mime);
+      const opened = await openPlanRaster(blob, file.name, mime);
+      planDocRef.current = opened.doc;
+      const planSpace = opened.kind === "pdf" ? "pdf-user" : "image";
+      const stamped = { ...record, planSpace } as GprcRecord;
+      recordRef.current = stamped;
+      await saveGprcRecord(id, stamped);
       if (planUrl.current) URL.revokeObjectURL(planUrl.current);
-      planUrl.current = raster.url;
-      setPlan({ url: raster.url, width: raster.width, height: raster.height });
+      planUrl.current = opened.raster.url;
+      setPlanDetail(null);
+      setPlan(opened.raster);
       setPlanName(file.name);
     } catch (err) {
       setPlanError(err instanceof Error ? err.message : "Could not open that plan.");
@@ -310,6 +351,84 @@ export function GprcLab() {
       setPlanLoading(false);
     }
   };
+
+  useEffect(() => {
+    const doc = planDocRef.current;
+    if (!doc || planDetail == null) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const page = await doc.getPage(1);
+        const base = page.getViewport({ scale: 1 });
+        const rendered = await renderPdfPage(doc, 1, { scale: planDetail });
+        if (cancelled) {
+          URL.revokeObjectURL(rendered.objectUrl);
+          return;
+        }
+        if (planUrl.current) URL.revokeObjectURL(planUrl.current);
+        planUrl.current = rendered.objectUrl;
+        setPlan({ url: rendered.objectUrl, width: base.width, height: base.height, renderScale: rendered.renderScale });
+      } catch (err) {
+        if (!cancelled) setPlanError(err instanceof Error ? err.message : "Could not redraw the plan.");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [planDetail]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.type === "keyup" && (event.key === " " || event.key === "Spacebar")) {
+        setSpacePan(false);
+        return;
+      }
+      const roaming = document.querySelector("[data-gprc-viewport] [data-nav]")?.getAttribute("data-nav") === "roam";
+      const command = resolveShortcut(event.key, {
+        editable: isEditableTarget(event.target),
+        drawerOpen: session.drawerOpen,
+        overlayOpen: document.querySelector("[data-overlay]") != null,
+        insertActive: session.mode === "insert",
+        moveActive: session.move != null,
+        expanded: expandedPane != null,
+        fullscreen: session.fullscreen,
+        pointerLocked: document.pointerLockElement != null,
+        roaming: roaming && expandedPane == null,
+        mod: event.metaKey || event.ctrlKey,
+        alt: event.altKey,
+      });
+      if (command === "native" || command === "ignore") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (command === "space-pan") {
+        setSpacePan(true);
+        return;
+      }
+      if (command === "close-drawer") session.setDrawerOpen(false);
+      else if (command === "dismiss-overlay") {
+        const nodes = document.querySelectorAll("[data-overlay]");
+        nodes[nodes.length - 1]?.dispatchEvent(new Event("gprc-dismiss"));
+      } else if (command === "cancel-insert") session.cancelInsert();
+      else if (command === "cancel-move") session.cancelMove();
+      else if (command === "exit-expanded") setExpandedPane(null);
+      else if (command === "exit-fullscreen") session.setFullscreen(false);
+      else if (command === "undo") {
+        if ((expandedPane ?? pane) === "plan") planUndoRef.current?.();
+        else session.undoPoint();
+      } else if (command === "delete") {
+        if ((expandedPane ?? pane) === "plan" && planDeleteRef.current?.()) return;
+        session.deleteSelectedProfile();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKey);
+    };
+  }, [session, expandedPane, pane]);
+
+  const expanded = expandedPane != null;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
@@ -349,7 +468,13 @@ export function GprcLab() {
         </button>
       </header>
       <div className="grid min-h-0 flex-1 grid-cols-1 overflow-auto lg:grid-cols-[minmax(0,1.86fr)_minmax(16rem,1fr)] lg:grid-rows-[minmax(0,1fr)] lg:overflow-hidden">
-        <section className="flex min-h-[420px] min-w-0 flex-col border-white/[0.06] lg:min-h-0">
+        <section
+          data-expanded={expanded ? expandedPane ?? undefined : undefined}
+          className={cn(
+            "flex min-w-0 flex-col border-white/[0.06]",
+            expanded ? "fixed inset-0 z-40 min-h-0 bg-background" : "min-h-[420px] lg:min-h-0",
+          )}
+        >
           <div className="flex gap-1 border-b border-white/[0.06] px-2 py-1">
             <PaneButton active={pane === "plan"} onClick={() => selectPane("plan")}>
               Mainline plan
@@ -383,11 +508,23 @@ export function GprcLab() {
                 if (id) setDock("georef");
               }}
               onMoveControl={moveControl}
+              onDeleteControl={(id) => {
+                saveGeoref({ ...georef, points: georef.points.filter((point) => point.id !== id) });
+                setSelectedControlId((current) => (current === id ? null : current));
+              }}
               onToolChange={(tool) => {
                 if (tool === "control") setDock("georef");
                 else setPickingControlId(null);
               }}
+              expanded={expandedPane === "plan"}
+              onToggleExpand={() => setExpandedPane((current) => (current === "plan" ? null : "plan"))}
+              spacePan={spacePan}
+              onDisplayScale={setPlanDetail}
+              undoRef={planUndoRef}
+              deleteRef={planDeleteRef}
             />
+            {expandedPane !== "plan" && (
+              <>
             <StationReferencePanel
               open={dock === "stations"}
               onToggle={() => setDock((current) => (current === "stations" ? null : "stations"))}
@@ -423,6 +560,8 @@ export function GprcLab() {
               options={exportOptions}
               onOptions={saveExportOptions}
             />
+              </>
+            )}
           </div>
           <div className={cn("min-h-0 flex-1 flex-col", pane === "sections" ? "flex" : "hidden")}>
             <GprcCrossSectionPane
@@ -431,12 +570,18 @@ export function GprcLab() {
               onShowPlan={() => selectPane("plan")}
               onAddStation={addStationByName}
               placedIds={placedIds}
+              expanded={expandedPane === "sections"}
+              onToggleExpand={() => setExpandedPane((current) => (current === "sections" ? null : "sections"))}
+              spacePan={spacePan}
             />
           </div>
         </section>
         <div
           data-gprc-viewport=""
-          className="h-full min-h-[320px] min-w-0 border-t border-white/[0.06] lg:min-h-0 lg:border-l lg:border-t-0"
+          className={cn(
+            "h-full min-h-[320px] min-w-0 border-t border-white/[0.06] lg:min-h-0 lg:border-l lg:border-t-0",
+            expanded && "hidden",
+          )}
         >
           <CorridorViewport
             stations={session.stations}
@@ -453,6 +598,7 @@ export function GprcLab() {
           />
         </div>
       </div>
+      {!expanded && (
       <BottomDock
         tab={session.dockTab}
         onTab={session.setDockTab}
@@ -477,6 +623,8 @@ export function GprcLab() {
           ),
         }}
       />
+      )}
+      {!expanded && (
       <GprcGuide
         pane={pane}
         onOpenProjects={() => session.setDrawerOpen(true)}
@@ -491,6 +639,7 @@ export function GprcLab() {
           setDock("export");
         }}
       />
+      )}
       <ProjectDrawer
         open={session.drawerOpen}
         projects={session.projects}
@@ -518,16 +667,31 @@ function PaneButton({ active, onClick, children }: { active: boolean; onClick: (
   );
 }
 
-async function rasterizePlan(blob: Blob, name: string, mime: string): Promise<PlanRaster> {
+async function openPlanRaster(
+  blob: Blob,
+  name: string,
+  mime: string,
+): Promise<{ raster: PlanRaster; doc: PDFDocumentProxy | null; kind: "pdf" | "image" }> {
   if (mime === "application/pdf" || name.toLowerCase().endsWith(".pdf")) {
     const doc = await openPdfDocument(await blob.arrayBuffer());
-    const page = await renderPdfPage(doc, 1);
-    return { url: page.objectUrl, width: page.width, height: page.height };
+    const pdfPage = await doc.getPage(1);
+    const base = pdfPage.getViewport({ scale: 1 });
+    const rendered = await renderPdfPage(doc, 1, { scale: legacyRasterScale(base.width, base.height) });
+    return {
+      kind: "pdf",
+      doc,
+      raster: {
+        url: rendered.objectUrl,
+        width: rendered.userWidth,
+        height: rendered.userHeight,
+        renderScale: rendered.renderScale,
+      },
+    };
   }
   const url = URL.createObjectURL(blob);
   try {
     const size = await readImageSize(url);
-    return { url, width: size.width, height: size.height };
+    return { kind: "image", doc: null, raster: { url, width: size.width, height: size.height } };
   } catch (err) {
     URL.revokeObjectURL(url);
     throw err;

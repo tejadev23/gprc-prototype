@@ -73,10 +73,24 @@ export type GprcRecord = {
   georef: Georef | null;
   /** What the 3D corridor KMZ export includes. */
   export: KmzOptions;
+  /**
+   * Pixel space of the stitched plan. Null until a plan is opened.
+   * `pdf-user` is PDF scale-1. `image` is a PNG/JPEG's natural pixels. `legacy-raster` is the old 3200px raster.
+   */
+  planSpace: "legacy-raster" | "pdf-user" | "image" | null;
 };
 
 export function emptyGprcRecord(): GprcRecord {
-  return { planFileName: null, planMime: null, pane: "plan", alignment: emptyAlignment(), view: defaultGprcView(), georef: null, export: normalizeKmzOptions(null) };
+  return {
+    planFileName: null,
+    planMime: null,
+    pane: "plan",
+    alignment: emptyAlignment(),
+    view: defaultGprcView(),
+    georef: null,
+    export: normalizeKmzOptions(null),
+    planSpace: null,
+  };
 }
 
 /** Older records have no alignment. Missing fields stay empty instead of being required. */
@@ -102,6 +116,7 @@ export function normalizeGprcRecord(raw: Partial<GprcRecord> | null | undefined)
     },
     georef: normalizeGeoref(raw?.georef),
     export: normalizeKmzOptions(raw?.export),
+    planSpace: raw?.planSpace === "pdf-user" || raw?.planSpace === "image" || raw?.planSpace === "legacy-raster" ? raw.planSpace : null,
   };
 }
 

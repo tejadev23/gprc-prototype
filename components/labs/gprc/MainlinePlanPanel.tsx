@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import {
   alignmentWarnings,
   chainageDistance,
@@ -14,12 +14,13 @@ import {
 import { canvasBox, clientToCanvasCss } from "@/lib/corridor/viewer";
 import { parseStation } from "@/lib/corridor/stations";
 import { cssToImage, fitView, imageToCss, pan, zoomAt } from "@/lib/tracing/coords";
+import { displayRenderScale, legacyRasterScale } from "@/lib/corridor/pdf-space";
 import type { ViewState } from "@/lib/tracing/types";
 import type { ControlPoint } from "@/lib/corridor/georef/model";
 import { cn } from "@/lib/utils";
 
-type Raster = { url: string; width: number; height: number };
-export type PlanTool = "inspect" | "trace" | "station" | "control";
+type Raster = { url: string; width: number; height: number; renderScale?: number };
+export type PlanTool = "inspect" | "pan" | "trace" | "station" | "control";
 
 type Props = {
   hasProject: boolean;
@@ -41,7 +42,14 @@ type Props = {
   onAddControl?: (px: number, py: number) => void;
   onSelectControl?: (id: string | null) => void;
   onMoveControl?: (id: string, px: number, py: number) => void;
+  onDeleteControl?: (id: string) => void;
   onToolChange?: (tool: PlanTool) => void;
+  expanded?: boolean;
+  onToggleExpand?: () => void;
+  spacePan?: boolean;
+  onDisplayScale?: (scale: number) => void;
+  undoRef?: MutableRefObject<(() => void) | null>;
+  deleteRef?: MutableRefObject<(() => boolean) | null>;
 };
 
 export function MainlinePlanPanel({
@@ -62,7 +70,14 @@ export function MainlinePlanPanel({
   onAddControl,
   onSelectControl,
   onMoveControl,
+  onDeleteControl,
   onToolChange,
+  expanded = false,
+  onToggleExpand,
+  spacePan = false,
+  onDisplayScale,
+  undoRef,
+  deleteRef,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const viewRef = useRef<ViewState | null>(null);
@@ -82,7 +97,9 @@ export function MainlinePlanPanel({
   const [chainageError, setChainageError] = useState<string | null>(null);
   const [confirmReplace, setConfirmReplace] = useState(false);
   const [selectStationFt, setSelectStationFt] = useState<number | null>(null);
-  const rasterKey = raster?.url ?? "";
+  const promptRef = useRef<HTMLFormElement>(null);
+  const replaceRef = useRef<HTMLSpanElement>(null);
+  const rasterKey = raster ? `${raster.width}x${raster.height}` : "";
   const [seenRaster, setSeenRaster] = useState(rasterKey);
 
   if (rasterKey !== seenRaster) {
@@ -100,8 +117,9 @@ export function MainlinePlanPanel({
     }
   }
 
-  const fitted =
-    image && size.w >= 8 && size.h >= 8 ? fitView(size.w, size.h, image.naturalWidth, image.naturalHeight) : null;
+  const coordW = raster?.width ?? image?.naturalWidth ?? 0;
+  const coordH = raster?.height ?? image?.naturalHeight ?? 0;
+  const fitted = image && size.w >= 8 && size.h >= 8 && coordW > 0 && coordH > 0 ? fitView(size.w, size.h, coordW, coordH) : null;
   const view = userView ?? fitted;
   const warnings = alignmentWarnings(alignment.markers);
   const stationing =
@@ -117,6 +135,9 @@ export function MainlinePlanPanel({
     raster != null &&
     (raster.width !== alignment.rasterWidth || raster.height !== alignment.rasterHeight);
   const traced = alignment.points.length >= 2;
+
+  const coordRef = useRef({ w: 0, h: 0 });
+  coordRef.current = { w: coordW, h: coordH };
 
   useEffect(() => {
     viewRef.current = view;
@@ -155,7 +176,8 @@ export function MainlinePlanPanel({
       if (!current || !img) return;
       event.preventDefault();
       const css = clientToCanvasCss(event.clientX, event.clientY, canvasBox(canvas));
-      const min = fitView(canvas.clientWidth, canvas.clientHeight, img.naturalWidth, img.naturalHeight).scale * 0.5;
+      const space = coordRef.current;
+      const min = fitView(canvas.clientWidth, canvas.clientHeight, space.w || img.naturalWidth, space.h || img.naturalHeight).scale * 0.5;
       setUserView(zoomAt(current, css, event.deltaY > 0 ? 0.9 : 1.1, min, 16));
     };
     canvas.addEventListener("wheel", onWheel, { passive: false });
@@ -189,8 +211,11 @@ export function MainlinePlanPanel({
       ctx.fillText(message, cssW / 2, cssH / 2);
       return;
     }
-    ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(image, view.originX, view.originY, image.naturalWidth * view.scale, image.naturalHeight * view.scale);
+    const renderScale = raster?.renderScale ?? (image.naturalWidth / Math.max(raster?.width ?? image.naturalWidth, 1));
+    ctx.imageSmoothingEnabled = renderScale / Math.max(view.scale, 1e-6) < 1;
+    const drawW = (raster?.width ?? image.naturalWidth) * view.scale;
+    const drawH = (raster?.height ?? image.naturalHeight) * view.scale;
+    ctx.drawImage(image, view.originX, view.originY, drawW, drawH);
     strokePlan(ctx, alignment.points, view, "#7f1d1d", false);
     strokePlan(ctx, alignment.draft, view, "#fbbf24", true);
     const ready = new Set(readyStationIds);
@@ -246,7 +271,40 @@ export function MainlinePlanPanel({
       ctx.textBaseline = "top";
       ctx.fillText(control.name || "CP", css.x + arm + 3, css.y + 3);
     }
-  }, [image, view, size, loading, hasProject, alignment, selectedId, readyStationIds, controlPoints, selectedControlId]);
+  }, [image, view, size, loading, hasProject, alignment, selectedId, readyStationIds, controlPoints, selectedControlId, raster]);
+
+  useEffect(() => {
+    if (!raster) return;
+    const width = raster.width;
+    const height = raster.height;
+    const renderScale = raster.renderScale;
+    if (!onDisplayScale || !view || renderScale == null) return;
+    const scale = view.scale;
+    const handle = window.setTimeout(() => {
+      const next = Math.max(displayRenderScale(width, height, scale, window.devicePixelRatio || 1), legacyRasterScale(width, height));
+      if (Math.abs(next - renderScale) > 0.05) onDisplayScale(next);
+    }, 200);
+    return () => window.clearTimeout(handle);
+  }, [onDisplayScale, view, raster]);
+
+  useEffect(() => {
+    const node = promptRef.current;
+    if (!node) return;
+    const onDismiss = () => {
+      setPrompt(null);
+      setPromptError(null);
+    };
+    node.addEventListener("gprc-dismiss", onDismiss);
+    return () => node.removeEventListener("gprc-dismiss", onDismiss);
+  }, [prompt]);
+
+  useEffect(() => {
+    const node = replaceRef.current;
+    if (!node) return;
+    const onDismiss = () => setConfirmReplace(false);
+    node.addEventListener("gprc-dismiss", onDismiss);
+    return () => node.removeEventListener("gprc-dismiss", onDismiss);
+  }, [confirmReplace]);
 
   const fit = () => {
     const canvas = canvasRef.current;
@@ -306,6 +364,28 @@ export function MainlinePlanPanel({
     setSelectStationFt(stationFt);
   };
 
+  if (undoRef) {
+    undoRef.current = () => {
+      if (alignment.draft.length === 0) return;
+      onAlignment({ ...alignment, draft: alignment.draft.slice(0, -1) });
+    };
+  }
+  if (deleteRef) {
+    deleteRef.current = () => {
+      if (prompt || confirmReplace) return false;
+      if (tool === "control" && selectedControlId && onDeleteControl) {
+        onDeleteControl(selectedControlId);
+        return true;
+      }
+      if (tool === "station" && selectedId) {
+        onAlignment({ ...alignment, markers: alignment.markers.filter((marker) => marker.id !== selectedId) });
+        setSelectedId(null);
+        return true;
+      }
+      return false;
+    };
+  }
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex flex-wrap items-center gap-1.5 border-b border-white/[0.06] px-2 py-1">
@@ -331,6 +411,14 @@ export function MainlinePlanPanel({
         <button type="button" onClick={fit} disabled={!raster} className="rounded bg-white/10 px-2 py-1 text-[11px] disabled:opacity-40">
           Fit
         </button>
+        <ToolButton active={tool === "pan"} disabled={!raster} onClick={() => chooseTool("pan")}>
+          Pan
+        </ToolButton>
+        {onToggleExpand && (
+          <button type="button" onClick={onToggleExpand} className="rounded bg-white/10 px-2 py-1 text-[11px]">
+            {expanded ? "Exit" : "Expand"}
+          </button>
+        )}
         <ToolButton active={tool === "inspect"} onClick={() => chooseTool("inspect")}>
           Inspect
         </ToolButton>
@@ -383,7 +471,7 @@ export function MainlinePlanPanel({
           </button>
         )}
         {confirmReplace && (
-          <>
+          <span ref={replaceRef} data-overlay="replace" className="contents">
             <span className="text-[11px] text-amber-200">Clear the mainline and its markers?</span>
             <button
               type="button"
@@ -401,7 +489,7 @@ export function MainlinePlanPanel({
             <button type="button" onClick={() => setConfirmReplace(false)} className="rounded bg-white/10 px-2 py-1 text-[11px]">
               Keep
             </button>
-          </>
+          </span>
         )}
         <span className="truncate text-[11px] text-muted" title={fileName ?? undefined}>
           {fileName ?? "No plan loaded"}
@@ -420,11 +508,15 @@ export function MainlinePlanPanel({
       <div className="relative min-h-0 flex-1">
         <canvas
           ref={canvasRef}
-          className={cn("h-full w-full touch-none", grabbing ? "cursor-grabbing" : tool === "inspect" ? "cursor-grab" : "cursor-crosshair")}
+          className={cn(
+            "h-full w-full touch-none",
+            grabbing ? "cursor-grabbing" : tool === "inspect" || tool === "pan" || spacePan ? "cursor-grab" : "cursor-crosshair",
+          )}
+          onContextMenu={(event) => event.preventDefault()}
           onPointerDown={(event) => {
             if (!viewRef.current || event.button > 2) return;
             const css = clientToCanvasCss(event.clientX, event.clientY, canvasBox(event.currentTarget));
-            const panning = event.button === 1 || event.button === 2 || event.altKey || event.shiftKey || tool === "inspect";
+            const panning = event.button === 1 || event.button === 2 || event.altKey || event.shiftKey || tool === "inspect" || tool === "pan" || spacePan;
             dragRef.current = { x: css.x, y: css.y, moved: false, panning };
             if (panning) setGrabbing(true);
             try {
@@ -452,7 +544,7 @@ export function MainlinePlanPanel({
             const drag = dragRef.current;
             dragRef.current = null;
             setGrabbing(false);
-            if (!drag || drag.moved || drag.panning || tool === "inspect") return;
+            if (!drag || drag.moved || drag.panning || tool === "inspect" || tool === "pan" || spacePan) return;
             const css = clientToCanvasCss(event.clientX, event.clientY, canvasBox(event.currentTarget));
             const point = imagePoint(css);
             if (!point) return;
@@ -497,6 +589,8 @@ export function MainlinePlanPanel({
         />
         {prompt && (
           <form
+            ref={promptRef}
+            data-overlay="station"
             className="absolute left-2 top-2 z-10 w-56 rounded-md border border-white/10 bg-[#101214]/95 p-2 shadow-lg"
             onSubmit={(event) => {
               event.preventDefault();

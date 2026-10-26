@@ -44,9 +44,14 @@ export type Station = {
   existing: ProfilePoint[];
   proposed: ProfilePoint[];
   alignmentRef: AlignmentRef;
+  /**
+   * Pixel space of `calibration` points.
+   * Missing means the 3200-capped raster used before PDF user-space coordinates.
+   */
+  pdfSpace?: "legacy-raster" | "pdf-user";
 };
 
-export type TraceMode = "calibrate" | "existing" | "proposed";
+export type TraceMode = "calibrate" | "existing" | "proposed" | "insert";
 
 export type SectionAreas = {
   cut: number;
